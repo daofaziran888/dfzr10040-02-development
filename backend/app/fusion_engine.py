@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.models import (
+    BackfillPartitionReceipt,
     BackfillTask,
     ColdStoreStrategy,
     CrossValidatePlan,
@@ -22,6 +23,7 @@ from app.models import (
     MergeConflictRule,
     MetricAggrRule,
     PartitionRule,
+    PartitionCommitRecord,
     QualityGateRule,
     SchemaMapping,
     SnapshotPartition,
@@ -60,6 +62,10 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._partition_commits: dict[int, PartitionCommitRecord] = {}
+        self._backfill_receipts: dict[int, BackfillPartitionReceipt] = {}
+        # 实际写入证据：key=(目标宽表, 分区键值)，按订单号去重，重试只补缺不重复落行。
+        self._backfill_writes: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -208,7 +214,8 @@ class FusionEngine:
 
     def create_backfill_task(self, target_wide_table: str, backfill_range: str,
                              parallel_partitions: int = 4, dependency_check: str = "",
-                             checkpoint_position: str = "") -> BackfillTask:
+                             checkpoint_position: str = "",
+                             partition_dates: list[str] | None = None) -> BackfillTask:
         sid = self._next_seq()
         task = BackfillTask(
             task_id=sid, task_code=_generate_code("BACK", sid),
@@ -218,9 +225,461 @@ class FusionEngine:
             dependency_check=dependency_check,
             checkpoint_position=checkpoint_position,
             processed_rows=0, remaining_rows=0,
+            partition_dates=list(partition_dates or []),
         )
         self._backfills[sid] = task
         return task
+
+    # ---- 4.1 按日期批量回填与分区回执 ----
+
+    def record_partition_commit(self, target_wide_table: str, partition_key_value: str,
+                                order_id: str, amount: float | str,
+                                credential_code: str = "", committed: bool = True,
+                                source: str = "partition_table") -> PartitionCommitRecord:
+        """登记分区表侧的入账凭据。
+
+        行身份是（目标宽表、分区日期、订单号）：同一个订单号出现在不同业务日时，
+        按所在日期分别入账，不做跨日去重。
+        """
+        order_key = str(order_id)
+        for record in self._partition_commits.values():
+            if (record.target_wide_table == target_wide_table
+                    and record.partition_key_value == partition_key_value
+                    and record.order_id == order_key):
+                record.amount = float(amount)
+                record.committed = committed
+                record.source = source
+                if credential_code:
+                    record.credential_code = credential_code
+                return record
+
+        sid = self._next_seq()
+        record = PartitionCommitRecord(
+            commit_id=sid, commit_code=_generate_code("PCOM", sid),
+            target_wide_table=target_wide_table,
+            partition_key_value=partition_key_value,
+            order_id=order_key,
+            amount=float(amount),
+            credential_code=credential_code or f"CRED-{sid:04d}",
+            committed=committed,
+            source=source,
+            created_time=_now_iso(),
+        )
+        self._partition_commits[sid] = record
+        return record
+
+    def submit_batch_backfill(self, task_id: int,
+                              rows_by_date: dict[str, list[dict[str, Any]]],
+                              deliver_receipt_dates: list[str] | None = None) -> dict[str, Any]:
+        """按业务日批量补写：一次提交、逐日处理、逐日留下分区回执。
+
+        - 同一批业务日只允许提交一次，重复提交会被拒绝；
+        - 实际写入按（宽表、日期、订单号）去重，重试只补缺，不重复计入；
+        - 每个日期的新增行以分区提交记录核定，实际写入与入账凭据逐单对齐；
+        - deliver_receipt_dates 用来模拟回执交接中断：未列出的日期实际已写入，
+          但回执没有交付到下游，状态停在“待核/已核验”。
+        """
+        task = self._backfills.get(task_id)
+        if task is None:
+            return {"ok": False, "message": f"回填任务 {task_id} 不存在"}
+        if task.submitted_count >= 1:
+            return {
+                "ok": False,
+                "message": "同一批业务日只允许提交一次，请对未生效分区执行重试",
+                "duplicate_submission": True,
+                "submitted_count": task.submitted_count,
+            }
+
+        dates = [date for date in (task.partition_dates or sorted(rows_by_date)) if date]
+        if not dates:
+            return {"ok": False, "message": "批量回填至少需要一个业务日"}
+
+        deliver = set(dates if deliver_receipt_dates is None else deliver_receipt_dates)
+        per_date: list[dict[str, Any]] = []
+        submitted_total = 0
+
+        for date in dates:
+            rows = self._normalize_backfill_rows(rows_by_date.get(date, []))
+            if rows:
+                self._write_backfill_partition(task.target_wide_table, date, rows)
+            receipt = self._upsert_backfill_receipt(
+                task, date, submitted_rows=len(rows), deliver=date in deliver)
+            self._refresh_backfill_receipt(receipt)
+            submitted_total += len(rows)
+            per_date.append(receipt.to_record())
+
+        task.submitted_count += 1
+        task.processed_rows += submitted_total
+        task.checkpoint_position = ""
+        task.receipt_codes = [receipt["回执编号"] for receipt in per_date]
+        created = [self._find_receipt(task.task_code, date) for date in dates]
+        task.remaining_rows = sum(receipt.pending_rows for receipt in created if receipt)
+        if all(receipt.effective and receipt.delivered for receipt in created if receipt):
+            task.batch_status = "已完成"
+        elif any(receipt.effective for receipt in created if receipt):
+            task.batch_status = "部分待核"
+        else:
+            task.batch_status = "待核"
+
+        return {
+            "ok": True,
+            "message": "批量回填写入完成，分区回执逐日生成",
+            "task_code": task.task_code,
+            "submitted_count": task.submitted_count,
+            "submitted_rows": submitted_total,
+            "dates": dates,
+            "receipts": per_date,
+            "batch_status": task.batch_status,
+        }
+
+    def list_backfill_receipts(self, task_code: str | None = None) -> list[dict[str, Any]]:
+        """列出回填分区回执；只传日期时按任务编号过滤。"""
+        receipts = list(self._backfill_receipts.values())
+        if task_code:
+            receipts = [r for r in receipts if r.task_code == task_code]
+        receipts.sort(key=lambda r: (r.partition_key_value, r.receipt_code))
+        return [r.to_record() for r in receipts]
+
+    def verify_backfill_receipts(self, task_code: str | None = None,
+                                 target_wide_table: str = "",
+                                 dates: list[str] | None = None) -> dict[str, Any]:
+        """核验缺回执或待核日期的实际写入，回填回执里标清已提交和待核行数。
+
+        分区表已有入账凭据或回填端已有实际写入、但回执缺失的日期，
+        会先补出一条待核回执，再按逐单比对结果核定行数。
+        """
+        table = target_wide_table
+        if not table and task_code:
+            task = self._find_backfill_by_code(task_code)
+            table = task.target_wide_table if task else ""
+        candidate_tables = {table} if table else {
+            record.target_wide_table for record in self._partition_commits.values()
+        } | {key[0] for key in self._backfill_writes}
+        candidate_dates: set[str] = set(dates or [])
+        if not candidate_dates:
+            candidate_dates = {
+                record.partition_key_value for record in self._partition_commits.values()
+            } | {key[1] for key in self._backfill_writes}
+        for candidate_table in candidate_tables:
+            for date in sorted(candidate_dates):
+                if self._find_receipt(task_code, date, candidate_table) is not None:
+                    continue
+                evidence = self._partition_evidence(candidate_table, date)
+                if evidence["committed_rows"] == 0 and evidence["actual_rows"] == 0:
+                    continue
+                # 缺回执：实际写入尚未交付，补出的回执按待核定。
+                self._upsert_backfill_receipt(
+                    None, date, submitted_rows=evidence["actual_rows"],
+                    deliver=False, target_wide_table=candidate_table)
+
+        receipts = list(self._backfill_receipts.values())
+        if task_code:
+            receipts = [r for r in receipts if r.task_code == task_code]
+        if table:
+            receipts = [r for r in receipts if r.target_wide_table == table]
+        if dates:
+            wanted = set(dates)
+            receipts = [r for r in receipts if r.partition_key_value in wanted]
+        verified: list[dict[str, Any]] = []
+        for receipt in receipts:
+            self._refresh_backfill_receipt(receipt)
+            verified.append(receipt.to_record())
+        return {
+            "ok": True,
+            "task_code": task_code or "",
+            "verified": len(verified),
+            "receipts": verified,
+            "pending_rows": sum(
+                int(item["待核行"]) for item in verified),
+        }
+
+    def retry_backfill_partition(self, task_code: str, partition_key_value: str) -> dict[str, Any]:
+        """重试单个业务日：幂等重放实际写入，重新核定并交付回执。
+
+        不会增加提交次数，也不会把同一订单重复计入：
+        已存在的订单行只做覆盖核对，新增行数保持不变。
+        """
+        receipt = self._find_receipt(task_code, partition_key_value)
+        if receipt is None:
+            return {"ok": False, "message": f"业务日 {partition_key_value} 没有回填分区回执"}
+
+        attempted = [
+            {"order_id": line.get("order_id", ""), "amount": line.get("amount", 0)}
+            for line in receipt.detail
+        ]
+        before = len(self._backfill_writes.get(
+            (receipt.target_wide_table, receipt.partition_key_value), {}))
+        duplicates = 0
+        for line in attempted:
+            key = (receipt.target_wide_table, receipt.partition_key_value)
+            writes = self._backfill_writes.setdefault(key, {})
+            if str(line["order_id"]) in writes:
+                duplicates += 1
+            writes[str(line["order_id"])] = {
+                "order_id": str(line["order_id"]),
+                "amount": float(line["amount"]),
+            }
+        after = len(self._backfill_writes.get(
+            (receipt.target_wide_table, receipt.partition_key_value), {}))
+
+        receipt.retry_count += 1
+        receipt.delivered = True
+        self._refresh_backfill_receipt(receipt)
+
+        task = self._find_backfill_by_code(task_code)
+        if task is not None:
+            task.batch_status = (
+                "已完成" if all(
+                    (r := self._find_receipt(task_code, date)) is not None
+                    and r.effective
+                    and r.delivered
+                    for date in task.partition_dates
+                ) else "部分待核"
+            )
+
+        return {
+            "ok": True,
+            "message": "分区重试完成，回执已交付，未重复计入",
+            "task_code": task_code,
+            "partition_key_value": partition_key_value,
+            "submitted_rows": receipt.submitted_rows,
+            "committed_rows": receipt.committed_rows,
+            "pending_rows": receipt.pending_rows,
+            "actual_rows": receipt.actual_rows,
+            "rows_added": after - before,
+            "duplicates_skipped": duplicates,
+            "effective": receipt.effective,
+            "status": receipt.status,
+            "receipt": receipt.to_record(),
+        }
+
+    def pending_backfill_partitions(self, task_code: str | None = None) -> dict[str, Any]:
+        """仍待核的业务日及行数，交给值班同事续办。
+
+        已按实际写入核验通过、能够供下游取数的日期不会再出现在这里，
+        保证同一业务日不会同时作为“已交付”和“待补发”。
+        """
+        receipts = list(self._backfill_receipts.values())
+        if task_code:
+            receipts = [r for r in receipts if r.task_code == task_code]
+        latest: dict[tuple[str, str], BackfillPartitionReceipt] = {}
+        for receipt in receipts:
+            latest[(receipt.target_wide_table, receipt.partition_key_value)] = receipt
+
+        pending: list[dict[str, Any]] = []
+        for receipt in latest.values():
+            self._refresh_backfill_receipt(receipt)
+            if receipt.effective:
+                continue
+            pending.append({
+                "任务编号": receipt.task_code,
+                "目标宽表": receipt.target_wide_table,
+                "分区键值": receipt.partition_key_value,
+                "已提交行": receipt.committed_rows,
+                "待核行": receipt.pending_rows,
+                "实际写入行": receipt.actual_rows,
+                "回执编号": receipt.receipt_code,
+                "说明": receipt.note or "实际写入与分区提交记录不一致，需值班核验",
+            })
+        pending.sort(key=lambda item: (item["目标宽表"], item["分区键值"]))
+        return {"ok": True, "count": len(pending), "dates": pending}
+
+    def confirm_snapshot_from_backfill(
+        self, target_wide_table: str, dates: list[str] | None = None,
+        snapshot_statuses: dict[str, str] | None = None,
+        task_code: str | None = None,
+    ) -> dict[str, Any]:
+        """分区快照并发请求多个业务日时，用回填回执和实际写入确认分区状态。
+
+        两个端各自记录完成状态时会冲突：快照端可能已经标了“已完成”，
+        回填端回执却因交接中断仍停在待核。这里以分区提交记录和实际写入为准，
+        只有完全对得上的日期才标记为可用并交给下游。
+        """
+        if dates is None:
+            dates = []
+            for receipt in self._backfill_receipts.values():
+                if receipt.target_wide_table == target_wide_table:
+                    dates.append(receipt.partition_key_value)
+        dates = sorted(set(dates))
+
+        results: list[dict[str, Any]] = []
+        effective_dates: list[str] = []
+        pending_dates: list[dict[str, Any]] = []
+        conflict_dates: list[str] = []
+        statuses = snapshot_statuses or {}
+
+        for date in dates:
+            receipt = self._find_receipt(task_code, date, target_wide_table)
+            if receipt is None:
+                # 缺回执先按实际写入补一条待核回执，再参与状态核定。
+                self.verify_backfill_receipts(
+                    task_code=task_code, target_wide_table=target_wide_table, dates=[date])
+                receipt = self._find_receipt(task_code, date, target_wide_table)
+            if receipt is None:
+                results.append({
+                    "分区键值": date,
+                    "回填回执状态": "缺回执",
+                    "快照记录状态": statuses.get(date, "未记录"),
+                    "状态冲突": statuses.get(date) in ("已完成", "可用", "已提交"),
+                    "回填生效": False,
+                    "核定行数": 0,
+                    "待核行": 0,
+                    "结论": "缺回执且无实际写入，不能交给下游",
+                })
+                pending_dates.append({"分区键值": date, "待核行": 0})
+                continue
+
+            self._refresh_backfill_receipt(receipt)
+            claimed = statuses.get(date)
+            snapshot_complete = claimed in ("已完成", "可用", "已提交")
+            backfill_complete = receipt.delivered and receipt.status == "已提交"
+            conflict = claimed is not None and snapshot_complete != backfill_complete
+            if conflict:
+                conflict_dates.append(date)
+
+            snap = self._find_snapshot(target_wide_table, date)
+            if snap is None:
+                snap = self.create_snapshot(target_wide_table, date)
+            snap.record_count = receipt.committed_rows
+            snap.status_mark = "可用" if receipt.effective else "创建中"
+            snap.backfill_receipt_code = receipt.receipt_code
+            snap.backfill_effective = receipt.effective
+            snap.backfill_pending_rows = receipt.pending_rows
+            # 实际生效日期按整张宽表统计，避免只传单个日期时看不出本次回填生效范围。
+            snap.backfill_effective_dates = sorted({
+                candidate.partition_key_value
+                for candidate in self._backfill_receipts.values()
+                if candidate.target_wide_table == target_wide_table
+                and (not task_code or candidate.task_code == task_code)
+                and candidate.effective
+            })
+
+            if receipt.effective:
+                effective_dates.append(date)
+            else:
+                pending_dates.append({
+                    "分区键值": date,
+                    "待核行": receipt.pending_rows,
+                })
+
+            results.append({
+                "分区键值": date,
+                "分区编号": snap.partition_code,
+                "回填回执状态": receipt.status,
+                "回执已交付": receipt.delivered,
+                "快照记录状态": claimed or "未记录",
+                "状态冲突": conflict,
+                "回填生效": receipt.effective,
+                "核定行数": receipt.committed_rows,
+                "待核行": receipt.pending_rows,
+                "实际写入行": receipt.actual_rows,
+                "结论": (
+                    "分区已完整提交，可交给下游"
+                    if receipt.effective else "存在待核行，继续留在值班清单"
+                ),
+            })
+
+        return {
+            "ok": True,
+            "target_wide_table": target_wide_table,
+            "dates": results,
+            "effective_dates": effective_dates,
+            "pending_dates": pending_dates,
+            "conflict_dates": conflict_dates,
+            "conflict": len(conflict_dates) > 0,
+        }
+
+    # ---- 4.2 从分区快照按回执取数 ----
+
+    def export_readable_partitions(self, export_id: int | None = None,
+                                   target_wide_table: str = "",
+                                   dates: list[str] | None = None,
+                                   task_code: str | None = None,
+                                   materialize_missing: bool = True) -> dict[str, Any]:
+        """快照导出取数入口：按回填分区回执和实际写入证据选择可读分区。
+
+        只有实际写入与分区提交记录逐单对齐的日期才会被读出；
+        缺回执的日期会先核验实际写入，仍未对齐的日期跳过并留下待核行数。
+        返回的订单行同时带业务日期，能看出这次回填实际生效的日期。
+        materialize_missing=False 时用于只读预览：缺回执的日期只核验、不补登回执。
+        """
+        plan = self._exports.get(export_id) if export_id is not None else None
+        if export_id is not None and plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+
+        table = target_wide_table or (plan.target_wide_table if plan else "")
+        requested = list(dates or [])
+        if not requested and plan is not None and plan.partition_filter:
+            requested = [
+                part.strip() for part in plan.partition_filter.split(",") if part.strip()
+            ]
+        if not requested:
+            requested = sorted({
+                receipt.partition_key_value
+                for receipt in self._backfill_receipts.values()
+                if receipt.target_wide_table == table
+            })
+
+        rows: list[dict[str, Any]] = []
+        readable_dates: list[str] = []
+        skipped: list[dict[str, Any]] = []
+        receipts_used: list[dict[str, Any]] = []
+        per_date_counts: dict[str, int] = {}
+
+        for date in sorted(set(requested)):
+            receipt = self._find_receipt(task_code, date, table)
+            if receipt is None and materialize_missing:
+                # 缺回执的日期先核验实际写入，补出的回执仍按待核定，不会被当成已交付。
+                self.verify_backfill_receipts(
+                    task_code=task_code, target_wide_table=table, dates=[date])
+                receipt = self._find_receipt(task_code, date, table)
+            if receipt is None:
+                skipped.append({"分区键值": date, "待核行": 0, "原因": "没有回填回执或实际写入"})
+                continue
+
+            self._refresh_backfill_receipt(receipt)
+            receipts_used.append(receipt.to_record())
+            if not receipt.effective:
+                skipped.append({
+                    "分区键值": date,
+                    "待核行": receipt.pending_rows,
+                    "原因": "实际写入与分区提交记录未对齐，回执仍待核",
+                })
+                continue
+
+            readable_dates.append(date)
+            writes = self._backfill_writes.get((table, date), {})
+            day_rows: list[dict[str, Any]] = []
+            for order_id, write in sorted(writes.items()):
+                commit = self._find_commit(table, date, order_id)
+                row = {
+                    "日期": date,
+                    "订单号": order_id,
+                    "金额": write["amount"],
+                    "入账凭据": commit.credential_code if commit else "",
+                    "order_id": order_id,
+                    "amount": write["amount"],
+                }
+                day_rows.append(row)
+            per_date_counts[date] = len(day_rows)
+            rows.extend(day_rows)
+
+        if plan is not None:
+            plan.export_status = "已完成"
+        return {
+            "ok": True,
+            "plan_code": plan.plan_code if plan else "",
+            "target_wide_table": table,
+            "requested_dates": sorted(set(requested)),
+            "readable_dates": readable_dates,
+            "effective_dates": readable_dates,
+            "skipped_dates": skipped,
+            "rows": rows,
+            "exported_rows": len(rows),
+            "by_date": per_date_counts,
+            "receipts": receipts_used,
+        }
+
 
     def create_cold_store_strategy(self, target_wide_table: str, hot_data_days: int,
                                    cold_storage_type: str = "parquet",
@@ -744,6 +1203,232 @@ class FusionEngine:
         }
 
     # ---- 辅助方法 ----
+
+    @staticmethod
+    def _normalize_backfill_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把补写明细统一成 {order_id, amount}，订单号取订单号或 order_id。"""
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            order_id = row.get("order_id", row.get("订单号", row.get("order", "")))
+            amount = row.get("amount", row.get("金额", 0))
+            order_id = str(order_id).strip()
+            if not order_id:
+                continue
+            normalized.append({"order_id": order_id, "amount": float(amount)})
+        return normalized
+
+    def _write_backfill_partition(self, target_wide_table: str, date: str,
+                                  rows: list[dict[str, Any]]) -> int:
+        """把补写明细落到实际写入证据里；同一订单号只保留一行。"""
+        writes = self._backfill_writes.setdefault((target_wide_table, date), {})
+        before = len(writes)
+        for row in rows:
+            writes[row["order_id"]] = dict(row)
+        return len(writes) - before
+
+    def _partition_evidence(self, target_wide_table: str, date: str) -> dict[str, Any]:
+        """分区提交记录与实际写入证据的逐单比对结果。"""
+        commits = {
+            record.order_id: record
+            for record in self._partition_commits.values()
+            if record.target_wide_table == target_wide_table
+            and record.partition_key_value == date
+            and record.committed
+        }
+        writes = self._backfill_writes.get((target_wide_table, date), {})
+        matched = [
+            order_id for order_id in writes
+            if order_id in commits and float(commits[order_id].amount) == float(writes[order_id]["amount"])
+        ]
+        missing_commit = [order_id for order_id in writes if order_id not in commits]
+        mismatched = [
+            order_id for order_id in writes
+            if order_id in commits and float(commits[order_id].amount) != float(writes[order_id]["amount"])
+        ]
+        return {
+            "committed_rows": len(commits),
+            "actual_rows": len(writes),
+            "matched_rows": len(matched),
+            "missing_commit_rows": len(missing_commit),
+            "mismatched_rows": len(mismatched),
+            "matched": matched,
+            "missing_commit": missing_commit,
+            "mismatched": mismatched,
+        }
+
+    def _find_commit(self, target_wide_table: str, date: str,
+                     order_id: str) -> PartitionCommitRecord | None:
+        for record in self._partition_commits.values():
+            if (record.target_wide_table == target_wide_table
+                    and record.partition_key_value == date
+                    and record.order_id == str(order_id)
+                    and record.committed):
+                return record
+        return None
+
+    def _find_snapshot(self, target_wide_table: str, date: str) -> SnapshotPartition | None:
+        for snap in self._snapshots.values():
+            if snap.target_wide_table == target_wide_table and snap.partition_key_value == date:
+                return snap
+        return None
+
+    def _find_backfill_by_code(self, task_code: str) -> BackfillTask | None:
+        for task in self._backfills.values():
+            if task.task_code == task_code:
+                return task
+        return None
+
+    def _find_receipt(self, task_code: str | None, date: str,
+                      target_wide_table: str = "") -> BackfillPartitionReceipt | None:
+        candidates = [
+            receipt for receipt in self._backfill_receipts.values()
+            if receipt.partition_key_value == date
+            and (not task_code or receipt.task_code == task_code)
+            and (not target_wide_table or receipt.target_wide_table == target_wide_table)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda receipt: receipt.receipt_id)
+
+    def _upsert_backfill_receipt(self, task: BackfillTask | None, date: str,
+                                 submitted_rows: int, deliver: bool,
+                                 target_wide_table: str = "") -> BackfillPartitionReceipt:
+        table = target_wide_table or (task.target_wide_table if task else "")
+        task_code = task.task_code if task else ""
+        existing = self._find_receipt(task_code or None, date, table)
+        if existing is not None:
+            existing.submitted_rows = max(existing.submitted_rows, submitted_rows)
+            existing.delivered = existing.delivered or deliver
+            return existing
+
+        sid = self._next_seq()
+        receipt = BackfillPartitionReceipt(
+            receipt_id=sid,
+            receipt_code=_generate_code("BRCP", sid),
+            task_code=task_code,
+            target_wide_table=table,
+            partition_key_value=date,
+            submitted_rows=submitted_rows,
+            issued_time=_now_iso(),
+            delivered=deliver,
+        )
+        self._backfill_receipts[sid] = receipt
+        return receipt
+
+    def _refresh_backfill_receipt(self, receipt: BackfillPartitionReceipt) -> None:
+        """用分区提交记录和实际写入证据重新核定回执的已提交/待核行数。
+
+        新增行以分区提交记录为准；实际写入逐单核对：
+        - 回执成功交付且逐单一致的行记入“已提交”；
+        - 实际已写入但回执没交付、写入缺少入账凭据或金额对不上的行记入“待核”；
+        - 分区表已入账但回填端还没写出来的行同样记入“待核”。
+        """
+        table, date = receipt.target_wide_table, receipt.partition_key_value
+        evidence = self._partition_evidence(table, date)
+        writes = self._backfill_writes.get((table, date), {})
+        commits = {
+            record.order_id: record
+            for record in self._partition_commits.values()
+            if record.target_wide_table == table
+            and record.partition_key_value == date
+            and record.committed
+        }
+
+        detail: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for order_id, write in writes.items():
+            seen.add(order_id)
+            commit = commits.get(order_id)
+            matched = (
+                commit is not None
+                and float(commit.amount) == float(write["amount"])
+            )
+            detail.append({
+                "order_id": order_id,
+                "amount": float(write["amount"]),
+                "committed": bool(matched and receipt.delivered),
+                "written": True,
+                "credential": commit.credential_code if commit else "",
+            })
+        for order_id, commit in commits.items():
+            if order_id in seen:
+                continue
+            detail.append({
+                "order_id": order_id,
+                "amount": float(commit.amount),
+                "committed": False,
+                "written": False,
+                "credential": commit.credential_code,
+            })
+
+        receipt.detail = detail
+        receipt.actual_rows = evidence["actual_rows"]
+        receipt.committed_rows = sum(1 for line in detail if line["committed"])
+        receipt.pending_rows = len(detail) - receipt.committed_rows
+        receipt.verified_time = _now_iso()
+
+        if receipt.committed_rows > 0 and receipt.pending_rows == 0:
+            receipt.status = "已提交"
+            receipt.effective = True
+            receipt.note = "实际写入与分区提交记录逐单一致"
+        elif not writes and not commits:
+            receipt.status = "待提交"
+            receipt.effective = False
+            receipt.note = "没有实际写入"
+        else:
+            receipt.status = "待核"
+            receipt.effective = False
+            if not receipt.delivered:
+                receipt.note = "回执交接中断，实际写入已落盘但未交付下游"
+            elif receipt.pending_rows:
+                receipt.note = "实际写入与分区提交记录未对齐，需值班核验"
+            else:
+                receipt.note = "回执未交付"
+
+    def add_backfill_rows(self, target_wide_table: str, date: str,
+                          order_id: str, amount: float | str) -> PartitionCommitRecord:
+        """便捷入口：同时登记分区提交记录和实际写入，订单号按所在日期入账。"""
+        record = self.record_partition_commit(
+            target_wide_table=target_wide_table,
+            partition_key_value=date,
+            order_id=order_id,
+            amount=amount,
+        )
+        self._write_backfill_partition(
+            target_wide_table, date,
+            [{"order_id": str(order_id), "amount": float(amount)}],
+        )
+        return record
+
+    def backfill_batch_snapshot(self, task_code: str) -> dict[str, Any]:
+        """批量回填的逐日计数与交付证据汇总。"""
+        task = self._find_backfill_by_code(task_code)
+        receipts = [
+            receipt for receipt in self._backfill_receipts.values()
+            if receipt.task_code == task_code
+        ]
+        receipts.sort(key=lambda receipt: receipt.partition_key_value)
+        per_date = []
+        for receipt in receipts:
+            self._refresh_backfill_receipt(receipt)
+            per_date.append({
+                "日期": receipt.partition_key_value,
+                "已提交行": receipt.committed_rows,
+                "待核行": receipt.pending_rows,
+                "实际写入行": receipt.actual_rows,
+                "回执状态": receipt.status,
+                "实际生效": receipt.effective,
+                "明细": [line["order_id"] for line in receipt.detail if line["committed"]],
+            })
+        return {
+            "ok": task is not None,
+            "task_code": task_code,
+            "target_wide_table": task.target_wide_table if task else "",
+            "submitted_count": task.submitted_count if task else 0,
+            "dates": per_date,
+            "total_committed": sum(item["已提交行"] for item in per_date),
+            "total_pending": sum(item["待核行"] for item in per_date),
+        }
 
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
         for source in self._sources.values():

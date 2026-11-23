@@ -198,6 +198,11 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    # 回填确认结果：快照端与回填端并发时，以回执和实际写入核定完成状态。
+    backfill_receipt_code: str = ""
+    backfill_effective: bool = False
+    backfill_pending_rows: int = 0
+    backfill_effective_dates: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -209,6 +214,10 @@ class SnapshotPartition:
             "状态标记": self.status_mark,
             "依赖分区": ",".join(self.dependency_partitions),
             "创建时间": self.created_time,
+            "回填回执": self.backfill_receipt_code,
+            "回填生效": "是" if self.backfill_effective else "否",
+            "待核行数": str(self.backfill_pending_rows),
+            "实际生效日期": ",".join(self.backfill_effective_dates),
         }
 
 
@@ -224,6 +233,104 @@ class BackfillTask:
     checkpoint_position: str = ""
     processed_rows: int = 0
     remaining_rows: int = 0
+    # 按日期批量补写：一次提交覆盖多个业务日，逐日处理并各自留下分区回执。
+    partition_dates: list[str] = field(default_factory=list)
+    submitted_count: int = 0
+    receipt_codes: list[str] = field(default_factory=list)
+    batch_status: str = "待回填"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "任务编号": self.task_code,
+            "目标宽表": self.target_wide_table,
+            "回填区间": self.backfill_range,
+            "并行分区": str(self.parallel_partitions),
+            "依赖检查": self.dependency_check,
+            "断点位置": self.checkpoint_position,
+            "已处理行": str(self.processed_rows),
+            "剩余行数": str(self.remaining_rows),
+            "补写日期": ",".join(self.partition_dates),
+            "提交次数": str(self.submitted_count),
+            "回填分区回执": ",".join(self.receipt_codes),
+            "批次状态": self.batch_status,
+        }
+
+
+@dataclass
+class PartitionCommitRecord:
+    """分区提交记录：分区表侧对业务日入账结果的权威凭据。
+
+    行身份是 (目标宽表, 分区日期, 订单号)。同一订单号出现在不同业务日时，
+    按各自所在日期分别入账，不做跨日去重。
+    """
+    commit_id: int
+    commit_code: str
+    target_wide_table: str
+    partition_key_value: str
+    order_id: str
+    amount: float
+    credential_code: str
+    committed: bool = True
+    source: str = "partition_table"
+    created_time: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "提交编号": self.commit_code,
+            "目标宽表": self.target_wide_table,
+            "分区键值": self.partition_key_value,
+            "订单号": self.order_id,
+            "金额": self.amount,
+            "入账凭据": self.credential_code,
+            "提交状态": "已提交" if self.committed else "待提交",
+            "凭据来源": self.source,
+            "提交时间": self.created_time,
+        }
+
+
+@dataclass
+class BackfillPartitionReceipt:
+    """回填分区回执：批量补写在某个业务日上的交付凭据。
+
+    committed_rows 是分区提交记录核定、且回执已成功交接的行数；
+    pending_rows 是实际写入已存在、但回执尚未交接、需要值班核验的行数。
+    下游只读取 effective=True 的分区，避免把待核日期当成已交付。
+    """
+    receipt_id: int
+    receipt_code: str
+    task_code: str
+    target_wide_table: str
+    partition_key_value: str
+    submitted_rows: int = 0
+    committed_rows: int = 0
+    pending_rows: int = 0
+    actual_rows: int = 0
+    status: str = "待核"
+    effective: bool = False
+    detail: list[dict[str, Any]] = field(default_factory=list)
+    issued_time: str = ""
+    verified_time: str = ""
+    retry_count: int = 0
+    note: str = ""
+    delivered: bool = False
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "回执编号": self.receipt_code,
+            "任务编号": self.task_code,
+            "目标宽表": self.target_wide_table,
+            "分区键值": self.partition_key_value,
+            "补写行数": str(self.submitted_rows),
+            "已提交行": str(self.committed_rows),
+            "待核行": str(self.pending_rows),
+            "实际写入行": str(self.actual_rows),
+            "回执状态": self.status,
+            "实际生效": "是" if self.effective else "否",
+            "回执已交付": "是" if self.delivered else "否",
+            "重试次数": str(self.retry_count),
+            "回执时间": self.verified_time or self.issued_time,
+            "说明": self.note,
+        }
 
 
 @dataclass

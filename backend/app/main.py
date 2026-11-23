@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.demo_scenario import load_demo_scenario
 from app.routers import ROUTERS
 from app.store import store
 
@@ -38,3 +39,9 @@ def overview() -> dict[str, object]:
 # 否则固定路径会被动态路径抢先匹配。
 for module in ROUTERS:
     app.include_router(module.router)
+
+
+@app.on_event("startup")
+def load_demo() -> None:
+    """启动时装载值班演示场景：三个业务日批量回填与周三回执中断。"""
+    load_demo_scenario()

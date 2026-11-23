@@ -81,5 +81,25 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 按日期批量回填
+
+数据回填除了处理条数和断点外，还支持同一宽表多个业务日一次提交、逐日补写：
+
+- `POST /api/backfill-batch/submit`：一次提交多个业务日，按（宽表、日期、订单号）
+  去重写入；重复提交同一批业务日会被拒绝（`duplicate_submission`）。
+- `GET  /api/backfill-batch/receipts`：回填分区回执，逐日标清补写行数、已提交行、
+  待核行、实际写入行和回执状态。
+- `GET  /api/backfill-batch/pending`：仍待核的业务日及行数，留给值班续办。
+- `POST /api/backfill-batch/retry`：重试单个业务日，幂等重放，`rows_added` 为 0、
+  `duplicates_skipped` 记录已存在订单，不会重复计入。
+- `POST /api/backfill-batch/confirm`：分区快照并发请求多个日期时，以回执和实际写入
+  核定完成状态，返回 `effective_dates`、`pending_dates` 与 `conflict_dates`。
+- `POST /api/backfill-batch/export`：从快照导出取数，只读取已完整提交的分区，
+  返回带业务日期的订单行和金额；待核日期进入 `skipped_dates`。
+
+新增的行以分区提交记录（`POST /api/backfill-batch/commit`）核定；同一订单号出现在
+不同业务日时按所在日期分别入账。服务启动时会装载值班演示场景（`app/demo_scenario.py`）：
+三个业务日各补两行、订单 K 金额 11/22/33，周三回执交接中断，便于直接复现和续办。
+
 领域：数据工程
 子方向：数仓与数据湖
